@@ -1,0 +1,11 @@
+# build output
+*.exe
+*.pdb
+
+# personal data and local settings
+tasks.json
+tasks.json.tmp
+backups/
+attachments/
+*.ini
+
