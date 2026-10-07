@@ -47,7 +47,17 @@
     return { get, set };
   })();
 
-  const S = { tasks: [], timer: null, loaded: false };
+  const S = { tasks: [], timer: null, awake: { mode: 'off', until: 0, active: false }, loaded: false };
+
+  // Same list as the tray menu (TaskDeck.cs AwakeOptions).
+  const AWAKE_OPTIONS = [
+    { label: 'Off', mode: 'off' },
+    { label: 'For 1 hour', mode: 'timed', minutes: 60 },
+    { label: 'For 2 hours', mode: 'timed', minutes: 120 },
+    { label: 'For 4 hours', mode: 'timed', minutes: 240 },
+    { label: 'Until I turn it off', mode: 'on' },
+    { label: 'While a focus timer runs', mode: 'focus', hint: 'auto' },
+  ];
   const ui = {
     view: store.get('view', 'board'),
     groupBy: store.get('groupBy', 'status'),
@@ -80,6 +90,7 @@
       const data = await api('state');
       S.tasks = data.tasks || [];
       S.timer = data.timer || null;
+      S.awake = data.awake || S.awake;
       S.loaded = true;
       render();
     } catch (e) {
@@ -193,6 +204,7 @@
     renderFilters();
     if (ui.view === 'list') renderList(); else renderBoard();
     renderTimer();
+    renderAwake();
     if (ui.openId) renderDrawer(false);
   }
 
@@ -375,7 +387,61 @@
     const btn = $('#focusBtn');
     if (btn && ui.openId === t.id) btn.querySelector('span').textContent = 'Stop · ' + duration(secs);
   }
-  setInterval(() => { if (S.timer) renderTimer(); }, 1000);
+  setInterval(() => { if (S.timer) renderTimer(); if (S.awake.mode === 'timed') renderAwake(); }, 1000);
+
+  // ------------------------------------------------------------------ keep awake
+
+  function awakeLeft() {
+    const mins = Math.max(0, Math.ceil((S.awake.until - Date.now()) / 60000));
+    return mins >= 60 ? Math.floor(mins / 60) + 'h ' + String(mins % 60).padStart(2, '0') + 'm' : mins + ' min';
+  }
+
+  function renderAwake() {
+    const a = S.awake;
+    const btn = $('#awakeBtn');
+    btn.classList.toggle('on', !!a.active);
+    btn.classList.toggle('armed', a.mode === 'focus' && !a.active);
+    let label = '', title = 'Keep the screen awake: stops sleep and the lock screen';
+    if (a.mode === 'on') { label = 'Awake'; title = 'Screen kept awake until you turn it off'; }
+    else if (a.mode === 'timed') {
+      label = awakeLeft();
+      title = 'Screen kept awake until ' + new Date(a.until).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    } else if (a.mode === 'focus') { label = a.active ? 'Awake' : ''; title = 'Screen kept awake while a focus timer runs'; }
+    $('#awakeLabel').textContent = label;
+    btn.title = title;
+    if (!$('#awakeMenu').hidden) renderAwakeMenu();
+  }
+
+  function renderAwakeMenu() {
+    const a = S.awake;
+    const status = a.mode === 'timed' ? 'On until ' + new Date(a.until).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) + ' (' + awakeLeft() + ' left)'
+      : a.mode === 'on' ? 'On until you turn it off'
+      : a.mode === 'focus' ? (a.active ? 'On - a focus timer is running' : 'Turns on with the focus timer')
+      : 'Stops sleep and the lock screen, like a video playing.';
+    $('#awakeMenu').innerHTML = `<div class="menu-head"><b>Keep screen awake</b><small>${esc(status)}</small></div>` +
+      AWAKE_OPTIONS.map((o, i) => {
+        const on = o.mode === a.mode && o.mode !== 'timed'; // timed: the header line shows the end time
+        return `<button data-awake="${i}" class="${on ? 'on' : ''}"><svg class="tick" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>${esc(o.label)}</button>`;
+      }).join('');
+  }
+
+  function toggleAwakeMenu(force) {
+    const menu = $('#awakeMenu');
+    const show = force === undefined ? menu.hidden : force;
+    if (show) renderAwakeMenu();
+    menu.hidden = !show;
+  }
+
+  async function setAwake(opt) {
+    S.awake = {
+      mode: opt.mode,
+      until: opt.mode === 'timed' ? Date.now() + opt.minutes * 60000 : 0,
+      active: opt.mode === 'on' || opt.mode === 'timed' || (opt.mode === 'focus' && !!S.timer),
+    };
+    renderAwake();
+    try { await api('awake', { mode: opt.mode, minutes: opt.minutes || 0 }); }
+    catch (e) { toast('Could not change keep-awake: ' + e.message); load(); }
+  }
 
   async function startTimer(id) {
     if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
@@ -843,6 +909,11 @@
       return;
     }
 
+    const awakeOpt = el.closest('[data-awake]');
+    if (awakeOpt) { toggleAwakeMenu(false); return setAwake(AWAKE_OPTIONS[+awakeOpt.dataset.awake]); }
+    if (el.closest('#awakeBtn')) return toggleAwakeMenu();
+    if (!el.closest('#awakeMenu')) toggleAwakeMenu(false);
+
     const viewBtn = el.closest('#viewSwitch button');
     if (viewBtn) return setView(viewBtn.dataset.view);
     const tagBtn = el.closest('#filters [data-tag]');
@@ -992,6 +1063,7 @@
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); return; }
     if (!$('#palette').hidden) return;
     if (!$('#lightbox').hidden && e.key === 'Escape') { $('#lightbox').hidden = true; return; }
+    if (!$('#awakeMenu').hidden && e.key === 'Escape') { toggleAwakeMenu(false); return; }
     if (e.key === 'Escape' && ui.openId) { closeDrawer(); return; }
 
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || el.isContentEditable;
@@ -1096,6 +1168,9 @@
       { label: 'List grouped by due date', run: () => { ui.groupBy = 'due'; store.set('groupBy', 'due'); setView('list'); render(); } },
       { label: ui.hideDone ? 'Show done tasks in list' : 'Hide done tasks in list', run: () => { ui.hideDone = !ui.hideDone; store.set('hideDone', ui.hideDone); render(); } },
       { label: 'Toggle light / dark theme', run: toggleTheme },
+      S.awake.mode === 'off'
+        ? { label: 'Keep screen awake (until I turn it off)', run: () => setAwake(AWAKE_OPTIONS[4]) }
+        : { label: 'Stop keeping the screen awake', run: () => setAwake(AWAKE_OPTIONS[0]) },
       { label: 'Clear search and filters', run: () => { ui.search = ''; ui.tag = null; $('#search').value = ''; render(); } },
       { label: 'Export tasks as JSON', run: exportJson },
       { label: 'Open data folder', run: () => api('folder', {}) },

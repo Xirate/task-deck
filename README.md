@@ -42,6 +42,7 @@ Run `TaskDeck.exe`. A violet check icon appears in the tray and the window opens
   - Click a checkbox in the preview to tick it. The card then shows checklist progress.
   - Editor keys: Ctrl+B / I / K (link) / L (checklist). Enter continues a list, and Tab indents.
 - **Focus timer:** press **Start focus** on a task. Time is added to that task, a pill in the header shows the running timer, and you get a reminder after 25 minutes.
+- **Keep screen awake:** the ☕ button in the header (or the tray menu) stops the PC from sleeping, turning off the screen or locking. It makes the same Windows request a browser makes while playing a video. You can keep it on for 1, 2 or 4 hours, until you turn it off, or only while a focus timer runs. The tray icon shows an amber dot while it's active. Set `keep_awake=on` in the ini to have it on from startup.
 - **Extras:** a command palette (Ctrl+K) to jump to any task, a completions sparkline and a 🔥 streak, Undo after delete, "Copy as Markdown" for pasting a task into Teams or Jira, JSON export, light and dark themes, and a tray balloon at startup when tasks are due or overdue.
 - **Keys:** `N` new task · `/` search · `B` / `L` board or list · `E` edit notes · `F` start or stop focus · `Esc` close
 

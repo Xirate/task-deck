@@ -57,6 +57,7 @@ class Settings
     public string Browser = "";
     public bool OpenOnStart = true;
     public int FocusMinutes = 25;
+    public string KeepAwake = "off"; // off | on | focus - keep-awake mode when TaskDeck starts
 
     public string Url { get { return "http://localhost:" + Port + "/"; } }
 
@@ -76,6 +77,7 @@ class Settings
                     "quickadd_hotkey=Win+Alt+N\r\nopen_hotkey=Ctrl+Alt+D\r\n" +
                     "; Open the main window when TaskDeck starts (true/false)\r\nopen_on_start=true\r\n" +
                     "; Length of a focus session in minutes (you get a reminder when it's up)\r\nfocus_minutes=25\r\n" +
+                    "; Keep the screen awake (no sleep, no lock) from start: off, on, or focus (only while the focus timer runs)\r\nkeep_awake=off\r\n" +
                     "; Browser used for the app window. Empty = Edge, then Chrome, then your default browser.\r\n" +
                     "; Example: browser=C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\r\nbrowser=\r\n");
             }
@@ -96,6 +98,11 @@ class Settings
             else if (key == "browser") s.Browser = val;
             else if (key == "open_on_start") s.OpenOnStart = !val.Equals("false", StringComparison.OrdinalIgnoreCase) && val != "0";
             else if (key == "focus_minutes" && int.TryParse(val, out n) && n > 0) s.FocusMinutes = n;
+            else if (key == "keep_awake")
+            {
+                string v = val.ToLowerInvariant();
+                s.KeepAwake = v == "on" || v == "true" ? "on" : v == "focus" ? "focus" : "off";
+            }
         }
         return s;
     }
@@ -112,8 +119,10 @@ class TrayApp
     HotkeyWindow hotkeys;
     QuickAddForm quick;
     System.Windows.Forms.Timer ticker;
-    ToolStripMenuItem autostartItem, timerItem;
+    ToolStripMenuItem autostartItem, timerItem, awakeMenu;
     readonly SynchronizationContext ui = new WindowsFormsSynchronizationContext();
+    readonly KeepAwake awake = new KeepAwake();
+    Icon iconNormal, iconAwake;
     string lastFocusNotified;
 
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -130,8 +139,10 @@ class TrayApp
             return false;
         }
 
-        server = new Server(settings, store);
+        server = new Server(settings, store, awake);
         server.ShowRequested += delegate { ui.Post(delegate { ShowMain(null); }, null); };
+        server.AwakeRequested += (mode, minutes) => ui.Post(delegate { SetAwake(mode, minutes); }, null);
+        server.TimerChanged += delegate { ui.Post(delegate { UpdateAwake(); }, null); };
         try { server.Start(); }
         catch (Exception ex)
         {
@@ -157,9 +168,16 @@ class TrayApp
         var add = new ToolStripMenuItem("Quick add…", null, delegate { ShowQuickAdd(); });
         if (settings.QuickAddHotkey != "") add.ShortcutKeyDisplayString = settings.QuickAddHotkey;
         menu.Items.Add(add);
-        timerItem = new ToolStripMenuItem("Stop focus timer", null, delegate { store.StopTimer(); server.Broadcast("changed"); });
+        timerItem = new ToolStripMenuItem("Stop focus timer", null, delegate { store.StopTimer(); UpdateAwake(); server.Broadcast("changed"); });
         menu.Items.Add(timerItem);
         menu.Items.Add(new ToolStripSeparator());
+        awakeMenu = new ToolStripMenuItem("Keep screen awake");
+        foreach (var opt in AwakeOptions)
+        {
+            var o = opt;
+            awakeMenu.DropDownItems.Add(new ToolStripMenuItem(o.Item1, null, delegate { SetAwake(o.Item2, o.Item3); }) { Tag = o });
+        }
+        menu.Items.Add(awakeMenu);
         autostartItem = new ToolStripMenuItem("Start with Windows", null, delegate { ToggleAutostart(); });
         menu.Items.Add(autostartItem);
         menu.Items.Add(new ToolStripMenuItem("Open data folder", null, delegate { try { Process.Start(Settings.BaseDir); } catch { } }));
@@ -171,9 +189,17 @@ class TrayApp
             var t = store.ActiveTimer();
             timerItem.Visible = t != null;
             if (t != null) timerItem.Text = "Stop focus timer (" + Trim(t.Item1.title, 30) + ")";
+            awakeMenu.Text = "Keep screen awake" + awake.ShortLabel();
+            awakeMenu.Checked = awake.Mode != "off";
+            // timed entries stay unchecked; the submenu title shows the end time instead
+            foreach (ToolStripMenuItem item in awakeMenu.DropDownItems)
+                item.Checked = ((Tuple<string, string, int>)item.Tag).Item2 == awake.Mode && awake.Mode != "timed";
         };
 
-        tray = new NotifyIcon { Icon = Icons.App(), Text = "TaskDeck", ContextMenuStrip = menu, Visible = true };
+        iconNormal = Icons.App(false);
+        iconAwake = Icons.App(true);
+        awake.Set(settings.KeepAwake, 0); // applied by the first Tick() below
+        tray = new NotifyIcon { Icon = iconNormal, Text = "TaskDeck", ContextMenuStrip = menu, Visible = true };
         tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) ShowMain(null); };
 
         quick = new QuickAddForm(store);
@@ -201,8 +227,37 @@ class TrayApp
         return true;
     }
 
+    // label, mode, minutes - shared by the tray submenu (the page has the same list in app.js)
+    static readonly Tuple<string, string, int>[] AwakeOptions =
+    {
+        Tuple.Create("Off", "off", 0),
+        Tuple.Create("For 1 hour", "timed", 60),
+        Tuple.Create("For 2 hours", "timed", 120),
+        Tuple.Create("For 4 hours", "timed", 240),
+        Tuple.Create("Until I turn it off", "on", 0),
+        Tuple.Create("While a focus timer runs", "focus", 0),
+    };
+
+    void SetAwake(string mode, int minutes)
+    {
+        awake.Set(mode, minutes);
+        UpdateAwake();
+        server.Broadcast("changed");
+    }
+
+    // Re-applies the keep-awake request (UI thread only) and swaps the tray icon when it turns on or off.
+    void UpdateAwake()
+    {
+        string before = awake.Mode;
+        bool changed = awake.Apply(store.ActiveTimer() != null);
+        if (changed && tray != null) tray.Icon = awake.Active ? iconAwake : iconNormal;
+        if (changed || before != awake.Mode) server.Broadcast("changed"); // e.g. focus timer started, or a timed period ran out
+    }
+
     public void Stop()
     {
+        awake.Set("off", 0);
+        awake.Apply(false);
         if (ticker != null) ticker.Stop();
         if (hotkeys != null) hotkeys.Dispose();
         if (tray != null) { tray.Visible = false; tray.Dispose(); }
@@ -241,6 +296,8 @@ class TrayApp
                 server.Broadcast("focusdone");
             }
         }
+        UpdateAwake();
+        if (awake.Active) tip += "\nScreen kept awake" + (awake.Mode == "timed" ? awake.ShortLabel() : "");
         tray.Text = Trim(tip, 63);
     }
 
@@ -384,6 +441,53 @@ static class WindowFinder
     {
         if (IsIconic(h)) ShowWindow(h, 9); // SW_RESTORE
         SetForegroundWindow(h);
+    }
+}
+
+// Keeps the display on and the PC from idling into sleep or the lock screen - the same request a
+// browser makes while a video plays. Windows ties the request to the calling thread, so Apply() must
+// always run on the UI thread (which lives as long as the app).
+class KeepAwake
+{
+    [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
+    const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x1, ES_DISPLAY_REQUIRED = 0x2;
+
+    public volatile string Mode = "off"; // off | on | timed | focus
+    public long Until;                   // unix ms, for "timed"
+    public bool Active { get; private set; }
+
+    public void Set(string mode, int minutes)
+    {
+        Until = mode == "timed" ? Store.Now() + Math.Max(1, minutes) * 60000L : 0;
+        Mode = mode == "on" || mode == "timed" || mode == "focus" ? mode : "off";
+    }
+
+    // Returns true when the active state changed.
+    public bool Apply(bool focusRunning)
+    {
+        if (Mode == "timed" && Store.Now() >= Until) Mode = "off";
+        bool want = Mode == "on" || Mode == "timed" || (Mode == "focus" && focusRunning);
+        SetThreadExecutionState(want ? ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
+        bool changed = want != Active;
+        Active = want;
+        return changed;
+    }
+
+    public Dictionary<string, object> Info()
+    {
+        return new Dictionary<string, object> { { "mode", Mode }, { "until", Until }, { "active", Active } };
+    }
+
+    // " (until 15:30)", " (on)", " (with focus timer)" or "" - appended to menu and tooltip text.
+    public string ShortLabel()
+    {
+        switch (Mode)
+        {
+            case "on": return " (on)";
+            case "timed": return " (until " + new DateTime(1970, 1, 1).AddMilliseconds(Until).ToLocalTime().ToString("HH:mm") + ")";
+            case "focus": return " (with focus timer)";
+            default: return "";
+        }
     }
 }
 
@@ -600,13 +704,13 @@ class Store
         Rev++;
     }
 
-    public string StateJson()
+    public string StateJson(object awake)
     {
         lock (sync)
         {
             return json.Serialize(new Dictionary<string, object>
             {
-                { "rev", Rev }, { "tasks", doc.tasks }, { "timer", doc.timer }, { "now", Now() },
+                { "rev", Rev }, { "tasks", doc.tasks }, { "timer", doc.timer }, { "now", Now() }, { "awake", awake },
             });
         }
     }
@@ -938,14 +1042,17 @@ class Server
     readonly List<HttpListenerResponse> streams = new List<HttpListenerResponse>();
     readonly Settings settings;
     readonly Store store;
+    readonly KeepAwake awake;
     public event Action ShowRequested;
+    public event Action<string, int> AwakeRequested;
+    public event Action TimerChanged;
 
     static readonly Dictionary<string, string> Pages = new Dictionary<string, string>
     {
         { "/", "index.html" }, { "/app.css", "app.css" }, { "/app.js", "app.js" }, { "/md.js", "md.js" },
     };
 
-    public Server(Settings settings, Store store) { this.settings = settings; this.store = store; }
+    public Server(Settings settings, Store store, KeepAwake awake) { this.settings = settings; this.store = store; this.awake = awake; }
 
     public int ClientCount { get { lock (streams) return streams.Count; } }
 
@@ -1025,7 +1132,7 @@ class Server
         switch (action)
         {
             case "state":
-                result = store.StateJson();
+                result = store.StateJson(awake.Info());
                 break;
             case "show":
                 if (ShowRequested != null) ShowRequested();
@@ -1049,11 +1156,13 @@ class Server
                 var t = store.Update(str("id"), f);
                 if (t == null) { Send(resp, 404, "application/json", Err("No such task")); return; }
                 result = store.Serialize(t);
+                if (TimerChanged != null) TimerChanged(); // finishing a task stops its timer
                 Broadcast("changed");
                 break;
             }
             case "delete":
                 store.Delete(str("id"));
+                if (TimerChanged != null) TimerChanged();
                 result = "{\"ok\":true}";
                 Broadcast("changed");
                 break;
@@ -1064,9 +1173,18 @@ class Server
                 break;
             case "timer":
                 if (str("action") == "start") store.StartTimer(str("id")); else store.StopTimer();
+                if (TimerChanged != null) TimerChanged();
                 result = "{\"ok\":true}";
                 Broadcast("changed");
                 break;
+            case "awake":
+            {
+                object m;
+                int minutes = f.TryGetValue("minutes", out m) && m is int ? (int)m : 0;
+                if (AwakeRequested != null) AwakeRequested(str("mode") ?? "off", minutes);
+                result = "{\"ok\":true}";
+                break; // the tray app broadcasts "changed" once the new mode is applied
+            }
             case "attach":
             {
                 byte[] data = Convert.FromBase64String(str("data") ?? "");
@@ -1221,7 +1339,8 @@ class Server
 static class Icons
 {
     // A rounded violet square with a white check mark, drawn at runtime so the exe needs no .ico file.
-    public static Icon App()
+    // `awake` adds an amber dot in the corner while the screen is being kept awake.
+    public static Icon App(bool awake)
     {
         using (var bmp = new Bitmap(32, 32))
         {
@@ -1233,6 +1352,11 @@ static class Icons
                     g.FillPath(b, path);
                 using (var p = new Pen(Color.White, 3.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
                     g.DrawLines(p, new[] { new PointF(9, 16.5f), new PointF(14, 21.5f), new PointF(23, 11) });
+                if (awake)
+                {
+                    using (var ring = new SolidBrush(Color.FromArgb(24, 25, 32))) g.FillEllipse(ring, 19, 19, 13, 13);
+                    using (var dot = new SolidBrush(Color.FromArgb(242, 169, 59))) g.FillEllipse(dot, 21, 21, 9, 9);
+                }
             }
             return Icon.FromHandle(bmp.GetHicon());
         }
