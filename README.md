@@ -2,6 +2,8 @@
 
 A small personal task tracker for Windows. It's one ~150 KB exe that sits in the tray. The main window is a Kanban board / list (Edge in app mode, so it looks like a normal desktop window), and you can add a task from anywhere in Windows with a hotkey.
 
+**[⬇ Download TaskDeck.exe](https://github.com/Xirate/task-deck/releases/latest/download/TaskDeck.exe)**. Put it in its own folder and run it, there's nothing to install. You can also [build it yourself](#build).
+
 ![TaskDeck board](docs/board.png)
 
 Each task opens a panel with its status, priority, due date, tags, focus timer and its own Markdown notes:
